@@ -6,10 +6,6 @@ services:
     startCommand: "gunicorn app:app --workers 1 --timeout 3600 --bind 0.0.0.0:$PORT"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/project/.browsers
-    # Plan gratuit Render — 512MB RAM, OK pour Playwright
-    # Attention : le service "spin down" après 15min d'inactivité sur le plan gratuit
-    # → le premier appel après inactivité prend ~30sec (cold start)
-    # Pour éviter ça : plan Starter à 7$/mois
