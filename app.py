@@ -207,11 +207,17 @@ async def get_attr(el, sels, attr="href"):
 
 async def extract_cards(page, sels):
     results = []
-    cards = await page.query_selector_all(sels["card"])
+    try:
+        cards = await page.query_selector_all(sels["card"])
+    except Exception:
+        return results
     if not cards:
         for fb in ["article","[class*='result']","[class*='listing']"]:
-            cards = await page.query_selector_all(fb)
-            if cards: break
+            try:
+                cards = await page.query_selector_all(fb)
+                if cards: break
+            except Exception:
+                continue
     for card in cards:
         nom = await get_text(card, sels["nom"])
         if not nom: continue
@@ -254,8 +260,9 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
         url = build_url(slug, rubrique, page_num)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=22000)
-            await asyncio.sleep(1.2)
-        except PwTimeout:
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1.5)
+        except Exception:
             break
 
         if page_num == 1:
