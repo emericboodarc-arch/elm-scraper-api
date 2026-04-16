@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
-ELM Scraper API — Déploiement Render.com
-=========================================
-API REST appelée par Apps Script pour scraper Pages Jaunes.
-
-Routes :
-  POST /scrape          → Lance le scraping (async)
-  GET  /status          → Progression en cours
-  GET  /result          → Résultat JSON
-  GET  /ping            → Health check
+ELM Scraper API — Deploiement Render.com
 """
 
 import asyncio
@@ -20,17 +12,12 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
-
-# ---------------------------------------------------------------------------
-# Etat global du scraping
-# ---------------------------------------------------------------------------
 
 class ScrapeState:
     def __init__(self):
@@ -54,10 +41,6 @@ def log(msg):
         STATE.log.append(line)
         if len(STATE.log) > 300:
             STATE.log = STATE.log[-300:]
-
-# ---------------------------------------------------------------------------
-# Categories et rubriques (calquees sur l'ELM APEF)
-# ---------------------------------------------------------------------------
 
 CATEGORIES = {
     "Personnes dependantes": [
@@ -117,12 +100,9 @@ DELAY_PAGE    = 1.5
 DELAY_RUB     = 2.0
 DELAY_COMMUNE = 2.5
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def normalize_slug(text):
-    table = {
+    t = {
         "\xe9":"e","\xe8":"e","\xea":"e","\xeb":"e",
         "\xe0":"a","\xe2":"a","\xe4":"a",
         "\xf4":"o","\xf6":"o","\xee":"i","\xef":"i",
@@ -131,7 +111,7 @@ def normalize_slug(text):
         " ":"-","'":"-","\u2019":"-","/":"-",
     }
     s = text.lower()
-    for src, dst in table.items():
+    for src, dst in t.items():
         s = s.replace(src, dst)
     s = re.sub(r"[^a-z0-9\-]", "", s)
     return re.sub(r"-+", "-", s).strip("-")
@@ -145,9 +125,6 @@ def build_url(slug, rubrique, page=1):
     base = f"https://www.pagesjaunes.fr/annuaire/{slug}/{rubrique}"
     return base if page == 1 else f"{base}?page={page}"
 
-# ---------------------------------------------------------------------------
-# Scraping avec Playwright
-# ---------------------------------------------------------------------------
 
 async def accept_cookies(page):
     for sel in ["#onetrust-accept-btn-handler", "button#acceptAll", "button[id*='accept']"]:
@@ -162,7 +139,17 @@ async def accept_cookies(page):
 
 
 async def detect_selectors(page):
-    html = await page.content()
+    try:
+        html = await page.content()
+    except Exception:
+        return {
+            "card":      "article",
+            "nom":       ["h2 a","h3 a","a[href*='/pros/']"],
+            "adresse":   ["address"],
+            "ville":     [],
+            "telephone": [],
+            "url_fiche": ["a[href*='/pros/']"],
+        }
     card_sel = "article"
     for hint in ["bi-pro", "listing-result", "result-item", "search-result"]:
         matches = re.findall(r'class="([^"]*' + hint + r'[^"]*)"', html)
@@ -187,7 +174,8 @@ async def get_text(el, sels):
             child = await el.query_selector(s)
             if child:
                 t = (await child.inner_text()).strip()
-                if t: return t
+                if t:
+                    return t
         except Exception:
             pass
     return ""
@@ -199,7 +187,8 @@ async def get_attr(el, sels, attr="href"):
             child = await el.query_selector(s)
             if child:
                 v = await child.get_attribute(attr)
-                if v: return v
+                if v:
+                    return v
         except Exception:
             pass
     return ""
@@ -207,40 +196,48 @@ async def get_attr(el, sels, attr="href"):
 
 async def extract_cards(page, sels):
     results = []
+    # Recupere les cards — chaque appel dans son propre try
     try:
         cards = await page.query_selector_all(sels["card"])
     except Exception:
         return results
     if not cards:
-        for fb in ["article","[class*='result']","[class*='listing']"]:
+        for fb in ["article", "[class*='result']", "[class*='listing']"]:
             try:
                 cards = await page.query_selector_all(fb)
-                if cards: break
+                if cards:
+                    break
             except Exception:
                 continue
+    if not cards:
+        return results
     for card in cards:
-        nom = await get_text(card, sels["nom"])
-        if not nom: continue
-        adresse  = await get_text(card, sels["adresse"])
-        ville    = await get_text(card, sels["ville"])
-        tel      = await get_text(card, sels["telephone"])
-        if not tel:
-            h = await get_attr(card, ["a[href^='tel:']"], "href")
-            if h: tel = h.replace("tel:", "")
-        href = await get_attr(card, sels["url_fiche"], "href")
-        url_fiche = (href if href.startswith("http") else f"https://www.pagesjaunes.fr{href}") if href else ""
-        results.append({
-            "nom":       nom,
-            "adresse":   adresse.strip(),
-            "ville":     re.sub(r"\s+", " ", ville).strip(),
-            "telephone": tel.strip(),
-            "url_fiche": url_fiche,
-        })
+        try:
+            nom = await get_text(card, sels["nom"])
+            if not nom:
+                continue
+            adresse  = await get_text(card, sels["adresse"])
+            ville    = await get_text(card, sels["ville"])
+            tel      = await get_text(card, sels["telephone"])
+            if not tel:
+                h = await get_attr(card, ["a[href^='tel:']"], "href")
+                if h:
+                    tel = h.replace("tel:", "")
+            href = await get_attr(card, sels["url_fiche"], "href")
+            url_fiche = (href if href.startswith("http") else f"https://www.pagesjaunes.fr{href}") if href else ""
+            results.append({
+                "nom":       nom,
+                "adresse":   adresse.strip(),
+                "ville":     re.sub(r"\s+", " ", ville).strip(),
+                "telephone": tel.strip(),
+                "url_fiche": url_fiche,
+            })
+        except Exception:
+            continue
     return results
 
 
 async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
-    from playwright.async_api import TimeoutError as PwTimeout
     ctx = await browser.new_context(
         extra_http_headers=HEADERS,
         viewport={"width": 1280, "height": 900},
@@ -253,37 +250,42 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
     )
 
     results, seen = [], set()
-    sels = {"card":"article","nom":["h2 a"],"adresse":["address"],
-            "ville":[],"telephone":[],"url_fiche":["a[href*='/pros/']"]}
+    sels = {
+        "card":      "article",
+        "nom":       ["h2 a"],
+        "adresse":   ["address"],
+        "ville":     [],
+        "telephone": [],
+        "url_fiche": ["a[href*='/pros/']"],
+    }
 
     for page_num in range(1, MAX_PAGES + 1):
         url = build_url(slug, rubrique, page_num)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=22000)
-            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1.5)
         except Exception:
             break
 
         if page_num == 1:
             await accept_cookies(page)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
             sels = await detect_selectors(page)
 
         try:
             body = await page.inner_text("body")
         except Exception:
             break
-        if any(p in body.lower() for p in ["aucun r\xe9sultat","aucun resultat","0 r\xe9sultat","aucun professionnel"]):
+
+        if any(p in body.lower() for p in ["aucun r\xe9sultat", "aucun resultat", "0 r\xe9sultat", "aucun professionnel"]):
             break
 
         cards = await extract_cards(page, sels)
+
         if not cards and page.url != url:
-            try:
-                sels = await detect_selectors(page)
-                cards = await extract_cards(page, sels)
-            except Exception:
-                break
+            sels = await detect_selectors(page)
+            cards = await extract_cards(page, sels)
+
         if not cards:
             break
 
@@ -301,9 +303,6 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
     await ctx.close()
     return results
 
-# ---------------------------------------------------------------------------
-# Geocodage — bounding box par departement
-# ---------------------------------------------------------------------------
 
 BBOX_DEPT = {
     50: (48.55, 49.75, -2.10,  0.05),
@@ -318,12 +317,13 @@ BBOX_DEPT = {
 BBOX_FRANCE = (41.0, 51.5, -5.5, 9.6)
 
 ABBREV = {
-    r'\br\b':'rue', r'\bav\b':'avenue', r'\bbd\b':'boulevard',
-    r'\bpl\b':'place', r'\bche\b':'chemin', r'\bch\b':'chemin',
-    r'\bimp\b':'impasse', r'\brt\b':'route', r'\brte\b':'route',
-    r'\bzi\b':'zone industrielle', r'\bza\b':'zone artisanale',
-    r'\bdom\b':'domaine', r'\bham\b':'hameau',
+    r'\br\b': 'rue', r'\bav\b': 'avenue', r'\bbd\b': 'boulevard',
+    r'\bpl\b': 'place', r'\bche\b': 'chemin', r'\bch\b': 'chemin',
+    r'\bimp\b': 'impasse', r'\brt\b': 'route', r'\brte\b': 'route',
+    r'\bzi\b': 'zone industrielle', r'\bza\b': 'zone artisanale',
+    r'\bdom\b': 'domaine', r'\bham\b': 'hameau',
 }
+
 
 def expand(addr):
     s = addr.lower()
@@ -331,14 +331,17 @@ def expand(addr):
         s = re.sub(pat, rep, s)
     return s
 
+
 def clean_ville(raw, fallback):
     v = re.sub(r'\b\d{5}\b', '', raw)
     v = re.sub(r'\b\d{2}\b', '', v)
     v = re.sub(r'\s+', ' ', v).strip().strip('-')
     return v if v else fallback
 
+
 def in_bbox(lat, lng, bbox):
     return bbox[0] <= lat <= bbox[1] and bbox[2] <= lng <= bbox[3]
+
 
 def geocode_fr(adresse, ville_raw, commune_scraped, dpt):
     bbox  = BBOX_DEPT.get(dpt, BBOX_FRANCE)
@@ -352,7 +355,8 @@ def geocode_fr(adresse, ville_raw, commune_scraped, dpt):
         f"{addr_exp} {commune_scraped} {dpt}",
     ]:
         q = q.strip()
-        if not q: continue
+        if not q:
+            continue
         url = f"https://api-adresse.data.gouv.fr/search/?q={urllib.parse.quote(q)}&limit=3"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "ELM-API/1.0"})
@@ -369,13 +373,14 @@ def geocode_fr(adresse, ville_raw, commune_scraped, dpt):
         time.sleep(0.1)
     return None
 
+
 def geocode_all(entries, dpt):
     ok = 0
     for i, e in enumerate(entries):
         if e.get("coords"):
             ok += 1
             continue
-        r = geocode_fr(e.get("adresse",""), e.get("ville",""), e.get("commune_scraped",""), dpt)
+        r = geocode_fr(e.get("adresse", ""), e.get("ville", ""), e.get("commune_scraped", ""), dpt)
         if r:
             e["coords"] = {"lat": r["lat"], "lng": r["lng"]}
             e["geocode_score"] = r["score"]
@@ -385,12 +390,8 @@ def geocode_all(entries, dpt):
             log(f"  Geocodage: {i+1}/{len(entries)} ({ok} ok)")
     return ok
 
-# ---------------------------------------------------------------------------
-# Thread principal de scraping
-# ---------------------------------------------------------------------------
 
 def run_scrape(communes, dpt, no_geocode):
-    import asyncio
     try:
         from playwright.async_api import async_playwright
 
@@ -405,8 +406,8 @@ def run_scrape(communes, dpt, no_geocode):
 
         log(f"Demarrage — {len(communes)} communes, dpt {dpt}")
 
-        all_results  = []
-        global_seen  = set()
+        all_results = []
+        global_seen = set()
 
         async def scrape():
             async with async_playwright() as p:
@@ -449,7 +450,7 @@ def run_scrape(communes, dpt, no_geocode):
                         if cat_new:
                             log(f"  {cat_label}: +{cat_new}")
 
-                    log(f"  → Partiel: {len(all_results)} concurrents")
+                    log(f"  Partiel: {len(all_results)} concurrents")
                     if i_c < len(communes) - 1:
                         await asyncio.sleep(DELAY_COMMUNE)
 
@@ -457,7 +458,6 @@ def run_scrape(communes, dpt, no_geocode):
 
         asyncio.run(scrape())
 
-        # Geocodage
         if not no_geocode:
             with STATE.lock:
                 STATE.step = "geocoding"
@@ -465,7 +465,6 @@ def run_scrape(communes, dpt, no_geocode):
             ok = geocode_all(all_results, dpt)
             log(f"Geocodage: {ok}/{len(all_results)} reussis")
 
-        # Stats
         stats = {}
         for r in all_results:
             c = r.get("categorie", "Autre")
@@ -501,9 +500,6 @@ def run_scrape(communes, dpt, no_geocode):
             STATE.running = False
             STATE.step    = "error"
 
-# ---------------------------------------------------------------------------
-# Routes Flask
-# ---------------------------------------------------------------------------
 
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -521,7 +517,7 @@ def status():
             "total":      STATE.total,
             "error":      STATE.error,
             "has_result": STATE.result is not None,
-            "log":        STATE.log[-50:],  # 50 dernières lignes
+            "log":        STATE.log[-50:],
         })
 
 
@@ -531,7 +527,7 @@ def result():
         r = STATE.result
     if r:
         return jsonify(r)
-    return jsonify({"error": "Aucun résultat disponible"}), 404
+    return jsonify({"error": "Aucun resultat disponible"}), 404
 
 
 @app.route("/result/summary", methods=["GET"])
@@ -539,8 +535,8 @@ def result_summary():
     with STATE.lock:
         r = STATE.result
     if not r:
-        return jsonify({"error": "Aucun résultat"}), 404
-    meta  = r.get("meta", {})
+        return jsonify({"error": "Aucun resultat"}), 404
+    meta = r.get("meta", {})
     return jsonify({
         "total":               meta.get("total", 0),
         "total_geocodes":      meta.get("total_geocodes", 0),
@@ -554,8 +550,7 @@ def scrape():
     if request.method == "OPTIONS":
         return "", 204
 
-    payload = request.get_json(silent=True) or {}
-
+    payload    = request.get_json(silent=True) or {}
     communes   = payload.get("communes", [])
     dpt        = int(payload.get("dpt", 50))
     no_geocode = bool(payload.get("no_geocode", False))
@@ -566,22 +561,18 @@ def scrape():
     with STATE.lock:
         if STATE.running:
             return jsonify({
-                "error":    "Scraping déjà en cours",
-                "commune":  STATE.commune,
-                "done":     STATE.done,
-                "total":    STATE.total,
+                "error":   "Scraping deja en cours",
+                "commune": STATE.commune,
+                "done":    STATE.done,
+                "total":   STATE.total,
             }), 409
 
-    t = threading.Thread(
-        target=run_scrape,
-        args=(communes, dpt, no_geocode),
-        daemon=True,
-    )
+    t = threading.Thread(target=run_scrape, args=(communes, dpt, no_geocode), daemon=True)
     t.start()
 
     return jsonify({
         "ok":       True,
-        "message":  f"Scraping lancé pour {len(communes)} communes",
+        "message":  f"Scraping lance pour {len(communes)} communes",
         "communes": communes,
         "dpt":      dpt,
     })
