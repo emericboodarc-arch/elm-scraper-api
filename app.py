@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ELM Scraper API — Deploiement Render.com
-Version job-based (compatible Apps Script asynchrone)
+Version job-based + mode FAST pour le dev
 """
 
 import asyncio
@@ -41,9 +41,6 @@ HEADERS = {
     "Referer": "https://www.google.fr/",
 }
 
-MAX_PAGES = 20
-DELAY_PAGE = 1.5
-DELAY_RUB = 2.0
 DELAY_COMMUNE = 2.5
 JOB_RETENTION_SECONDS = 7 * 24 * 3600  # 7 jours
 
@@ -107,6 +104,7 @@ def purge_old_jobs():
                 created_ts = datetime.fromisoformat(job.created_at).timestamp()
             except Exception:
                 created_ts = now
+
             if (now - created_ts) > JOB_RETENTION_SECONDS and not job.running:
                 to_delete.append(job_id)
 
@@ -332,7 +330,7 @@ async def extract_cards(page, sels):
     return results
 
 
-async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
+async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pages, delay_page):
     ctx = await browser.new_context(
         extra_http_headers=HEADERS,
         viewport={"width": 1280, "height": 900},
@@ -356,7 +354,7 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
         "url_fiche": ["a[href*='/pros/']"],
     }
 
-    for page_num in range(1, MAX_PAGES + 1):
+    for page_num in range(1, max_pages + 1):
         url = build_url(slug, rubrique, page_num)
 
         try:
@@ -367,11 +365,11 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
             except Exception:
                 break
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0 if delay_page >= 1 else 0.5)
 
         if page_num == 1:
             await accept_cookies(page)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             sels = await detect_selectors(page)
 
         try:
@@ -401,7 +399,7 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
         if len(cards) < 10:
             break
 
-        await asyncio.sleep(DELAY_PAGE)
+        await asyncio.sleep(delay_page)
 
     await ctx.close()
     return results
@@ -544,6 +542,20 @@ def run_scrape(job_id, communes, dpt, no_geocode):
 
         append_log(job, f"Demarrage — {len(communes)} communes, dpt {dpt}")
 
+        fast = bool(job.params.get("fast", False))
+
+        if fast:
+            max_pages = 3
+            rubriques_limit = 2
+            delay_page = 0.5
+            delay_rub = 0.5
+            append_log(job, "Mode FAST active")
+        else:
+            max_pages = 20
+            rubriques_limit = None
+            delay_page = 1.5
+            delay_rub = 2.0
+
         all_results = []
         global_seen = set()
 
@@ -569,11 +581,22 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                     slug = pj_slug(commune, dpt)
 
                     for cat_key, rubriques in CATEGORIES.items():
+                        if rubriques_limit:
+                            rubriques = rubriques[:rubriques_limit]
+
                         cat_label = CAT_LABELS[cat_key]
                         cat_new = 0
 
                         for rubrique in rubriques:
-                            res = await scrape_rubrique(browser, slug, commune, cat_key, rubrique)
+                            res = await scrape_rubrique(
+                                browser=browser,
+                                slug=slug,
+                                commune_nom=commune,
+                                cat_key=cat_key,
+                                rubrique=rubrique,
+                                max_pages=max_pages,
+                                delay_page=delay_page
+                            )
 
                             for r in res:
                                 kl = (r["nom"] + r["adresse"]).lower().strip()
@@ -588,7 +611,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                                     cat_new += 1
 
                             if res:
-                                await asyncio.sleep(DELAY_RUB)
+                                await asyncio.sleep(delay_rub)
 
                         if cat_new:
                             append_log(job, f"  {cat_label}: +{cat_new}")
@@ -596,7 +619,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                     append_log(job, f"  Partiel: {len(all_results)} concurrents")
 
                     if i_c < len(communes) - 1:
-                        await asyncio.sleep(DELAY_COMMUNE)
+                        await asyncio.sleep(DELAY_COMMUNE if not fast else 0.5)
 
                 await browser.close()
 
@@ -626,6 +649,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                 "total": len(all_results),
                 "total_geocodes": total_geo,
                 "stats_par_categorie": stats,
+                "fast": fast,
             },
             "concurrents": all_results,
         }
@@ -655,7 +679,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"ok": True, "server": "ELM Scraper API v3.0"})
+    return jsonify({"ok": True, "server": "ELM Scraper API v3.1-fast"})
 
 
 @app.route("/scrape", methods=["POST", "OPTIONS"])
@@ -672,7 +696,8 @@ def scrape():
     payload = request.get_json(silent=True) or {}
     communes = payload.get("communes", [])
     dpt = int(payload.get("dpt", 50))
-    no_geocode = bool(payload.get("no_geocode", False))
+    fast = bool(payload.get("fast", False))
+    no_geocode = bool(payload.get("no_geocode", False)) or fast
 
     if not communes:
         return jsonify({"error": "Champ 'communes' requis"}), 400
@@ -685,6 +710,7 @@ def scrape():
             "communes": communes,
             "dpt": dpt,
             "no_geocode": no_geocode,
+            "fast": fast,
         }
     )
     set_job(job_id, job)
@@ -702,6 +728,8 @@ def scrape():
         "message": f"Scraping lance pour {len(communes)} communes",
         "communes": communes,
         "dpt": dpt,
+        "fast": fast,
+        "no_geocode": no_geocode,
     })
 
 
@@ -778,6 +806,7 @@ def result_summary():
         "total_geocodes": meta.get("total_geocodes", 0),
         "date_extraction": meta.get("date_extraction", ""),
         "stats_par_categorie": meta.get("stats_par_categorie", {}),
+        "fast": meta.get("fast", False),
     })
 
 
@@ -817,6 +846,7 @@ def delete_job_route():
 
     payload = request.get_json(silent=True) or {}
     job_id = payload.get("jobId")
+
     if not job_id:
         return jsonify({"error": "jobId requis"}), 400
 
