@@ -262,10 +262,14 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
     for page_num in range(1, MAX_PAGES + 1):
         url = build_url(slug, rubrique, page_num)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=22000)
-            await asyncio.sleep(1.5)
+            await page.goto(url, wait_until="networkidle", timeout=25000)
         except Exception:
-            break
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                break
+
+        await asyncio.sleep(1.5)
 
         if page_num == 1:
             await accept_cookies(page)
