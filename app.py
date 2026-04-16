@@ -263,14 +263,20 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique):
             await asyncio.sleep(0.4)
             sels = await detect_selectors(page)
 
-        body = await page.inner_text("body")
+        try:
+            body = await page.inner_text("body")
+        except Exception:
+            break
         if any(p in body.lower() for p in ["aucun r\xe9sultat","aucun resultat","0 r\xe9sultat","aucun professionnel"]):
             break
 
         cards = await extract_cards(page, sels)
         if not cards and page.url != url:
-            sels = await detect_selectors(page)
-            cards = await extract_cards(page, sels)
+            try:
+                sels = await detect_selectors(page)
+                cards = await extract_cards(page, sels)
+            except Exception:
+                break
         if not cards:
             break
 
