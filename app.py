@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 ELM Scraper API — Deploiement Render.com
-Version job-based + diagnostics renforces + extraction PJ plus robuste
+Version job-based + anti-bot renforce + diagnostics complets
+Compatible Python 3.13
 """
 
 import asyncio
 import json
 import os
+import random
 import re
 import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -36,8 +37,11 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
     "Referer": "https://www.google.fr/",
 }
 
@@ -45,7 +49,11 @@ DELAY_COMMUNE = 2.5
 JOB_RETENTION_SECONDS = 7 * 24 * 3600  # 7 jours
 
 DEBUG_DUMP_DIR = os.environ.get("ELM_DEBUG_DUMP_DIR", "/tmp/elm_debug")
-MAX_DEBUG_HTML_PER_JOB = 12
+MAX_DEBUG_HTML_PER_JOB = 20
+
+DEFAULT_TIMEZONE = "Europe/Paris"
+DEFAULT_LAT = 49.1162
+DEFAULT_LNG = -1.0900
 
 
 # =============================================================================
@@ -135,9 +143,6 @@ def require_api_key():
 
 # =============================================================================
 # CATEGORIES
-# Notes:
-# - on met d'abord des slugs PJ observes actuellement
-# - on garde quelques variantes/fallbacks ensuite
 # =============================================================================
 
 CATEGORIES = {
@@ -208,8 +213,7 @@ def normalize_slug(text: str) -> str:
 
 
 def normalize_commune_label(text: str) -> str:
-    s = re.sub(r"\s+", " ", (text or "").strip())
-    return s
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
 def pj_slug(commune, dpt):
@@ -261,27 +265,100 @@ def save_debug_text(job: JobState, kind: str, commune: str, rubrique: str, conte
     return path
 
 
+def save_debug_json(job: JobState, kind: str, commune: str, rubrique: str, payload: dict) -> str:
+    ensure_debug_dir()
+
+    if len(job.debug_files) >= MAX_DEBUG_HTML_PER_JOB:
+        return ""
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{safe_filename(job.job_id)}__{safe_filename(commune)}__{safe_filename(rubrique)}__{kind}__{ts}.json"
+    path = os.path.join(DEBUG_DUMP_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    with JOBS_LOCK:
+        job.debug_files.append(path)
+
+    return path
+
+
 # =============================================================================
-# PLAYWRIGHT EXTRACTION
+# PLAYWRIGHT ANTI-BOT
 # =============================================================================
 
+STEALTH_JS = r"""
+(() => {
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+  Object.defineProperty(navigator, 'language', { get: () => 'fr-FR' });
+  Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr', 'en-US', 'en'] });
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+  window.chrome = window.chrome || { runtime: {} };
+
+  const originalQuery = window.navigator.permissions.query;
+  window.navigator.permissions.query = (parameters) => (
+    parameters && parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, parameter);
+  };
+})();
+"""
+
+
+async def human_pause(min_s=0.35, max_s=1.2):
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+async def human_scroll(page):
+    try:
+        for y in [200, 500, 900, 1300]:
+            await page.mouse.wheel(0, y)
+            await human_pause(0.15, 0.35)
+    except Exception:
+        pass
+
+
+async def human_mouse(page):
+    try:
+        await page.mouse.move(random.randint(100, 400), random.randint(100, 300), steps=12)
+        await human_pause(0.1, 0.25)
+        await page.mouse.move(random.randint(500, 900), random.randint(250, 600), steps=20)
+        await human_pause(0.1, 0.25)
+    except Exception:
+        pass
+
+
 async def accept_cookies(page):
-    for sel in [
+    selectors = [
         "#onetrust-accept-btn-handler",
         "button#acceptAll",
         "button[id*='accept']",
         "button[aria-label*='accepter']",
         "button:has-text('Tout accepter')",
         "button:has-text('Accepter')",
-    ]:
+        "button:has-text('J’accepte')",
+        "button:has-text('J'accepte')",
+    ]
+    for sel in selectors:
         try:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
                 await btn.click()
                 await asyncio.sleep(0.7)
-                return
+                return True
         except Exception:
             pass
+    return False
 
 
 async def collect_page_diagnostics(page):
@@ -315,19 +392,68 @@ async def collect_page_diagnostics(page):
     return {
         "title": title,
         "url": url,
-        "body_text": body_text[:8000] if body_text else "",
+        "body_text": body_text[:10000] if body_text else "",
         "pros_links": pros_links,
         "html": html,
     }
 
 
+def detect_challenge(diag: dict) -> str:
+    title = (diag.get("title") or "").lower()
+    url = (diag.get("url") or "").lower()
+    body = (diag.get("body_text") or "").lower()
+    html = (diag.get("html") or "").lower()
+
+    if "__cf_chl_rt_tk" in url:
+        return "cloudflare_challenge"
+    if "un instant" in title:
+        return "cloudflare_challenge"
+    if "just a moment" in title:
+        return "cloudflare_challenge"
+    if "cloudflare" in body or "cloudflare" in html:
+        return "cloudflare_challenge"
+    if "verify you are human" in body or "vérifiez que vous êtes humain" in body or "verifiez que vous etes humain" in body:
+        return "cloudflare_challenge"
+    if "captcha" in body:
+        return "captcha"
+    if "aucun résultat" in body or "aucun resultat" in body or "0 résultat" in body or "0 resultat" in body:
+        return "empty"
+    return ""
+
+
+async def wait_out_challenge(page, job, commune, rubrique):
+    """
+    Tente de laisser le challenge se résoudre.
+    """
+    for attempt in range(1, 4):
+        await human_pause(2.5, 4.0)
+        await human_mouse(page)
+        await human_scroll(page)
+        await human_pause(2.0, 3.0)
+
+        diag = await collect_page_diagnostics(page)
+        reason = detect_challenge(diag)
+
+        append_log(
+            job,
+            f"    challenge attempt {attempt} | title='{diag.get('title','')[:60]}' "
+            f"| pros_links={diag.get('pros_links', 0)} | reason={reason or 'none'}"
+        )
+
+        if reason != "cloudflare_challenge":
+            return diag, reason
+
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+    diag = await collect_page_diagnostics(page)
+    reason = detect_challenge(diag)
+    return diag, reason
+
+
 async def extract_entries_via_dom(page):
-    """
-    Extraction robuste:
-    - on part des liens /pros/
-    - on remonte vers un conteneur raisonnable
-    - on extrait nom / adresse / telephone via JS
-    """
     js = r"""
     () => {
       const anchors = Array.from(document.querySelectorAll('a[href*="/pros/"]'));
@@ -340,11 +466,11 @@ async def extract_entries_via_dom(page):
 
       function nearestCard(el) {
         let cur = el;
-        for (let i = 0; i < 6 && cur; i++, cur = cur.parentElement) {
+        for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) {
           if (!cur) break;
           const tag = (cur.tagName || '').toLowerCase();
           const txt = clean(cur.innerText || '');
-          if (txt.length > 30 && txt.length < 2500 && ['article','li','section','div'].includes(tag)) {
+          if (txt.length > 30 && txt.length < 3000 && ['article','li','section','div'].includes(tag)) {
             return cur;
           }
         }
@@ -359,9 +485,7 @@ async def extract_entries_via_dom(page):
       function findAddress(cardText) {
         const lines = cardText.split('\n').map(clean).filter(Boolean);
         for (const line of lines) {
-          if (/\b\d{5}\b/.test(line)) {
-            return line;
-          }
+          if (/\b\d{5}\b/.test(line)) return line;
         }
         for (const line of lines) {
           if (/\b(rue|avenue|av\.?|boulevard|bd\.?|place|pl\.?|chemin|route|impasse|all[ée]e|lieu-dit|za|zi)\b/i.test(line)) {
@@ -395,7 +519,7 @@ async def extract_entries_via_dom(page):
 
         let nom = clean(a.innerText || '');
         if (!nom || nom.length < 2) {
-          const h = card.querySelector('h1,h2,h3,h4,[class*="denomination"],[class*="title"]');
+          const h = card.querySelector('h1,h2,h3,h4,[class*="denomination"],[class*="title"],[data-testid*="title"]');
           nom = clean(h ? h.innerText : '');
         }
         if (!nom || nom.length < 2) continue;
@@ -431,62 +555,55 @@ async def extract_entries_via_dom(page):
         return []
 
 
-def body_looks_empty_or_blocked(body: str) -> str:
-    txt = (body or "").lower()
-
-    block_patterns = [
-        "captcha",
-        "vérifiez que vous êtes humain",
-        "verifiez que vous etes humain",
-        "accès refusé",
-        "access denied",
-        "forbidden",
-        "temporarily unavailable",
-    ]
-    for p in block_patterns:
-        if p in txt:
-            return "blocked"
-
-    empty_patterns = [
-        "aucun résultat",
-        "aucun resultat",
-        "0 résultat",
-        "0 resultat",
-        "aucun professionnel",
-    ]
-    for p in empty_patterns:
-        if p in txt:
-            return "empty"
-
-    return ""
-
-
-async def scrape_single_url(page, url, commune_nom, rubrique, job):
+async def goto_url(page, url):
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+        return True
     except Exception:
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            return True
         except Exception:
-            return {
-                "entries": [],
-                "diag": {
-                    "url": url,
-                    "title": "",
-                    "final_url": getattr(page, "url", url),
-                    "pros_links": 0,
-                    "reason": "goto_failed",
-                },
-            }
+            return False
 
-    await asyncio.sleep(1.0)
+
+async def scrape_single_url(page, url, commune_nom, rubrique, job):
+    ok = await goto_url(page, url)
+    if not ok:
+        return {
+            "entries": [],
+            "diag": {
+                "url": url,
+                "title": "",
+                "final_url": getattr(page, "url", url),
+                "pros_links": 0,
+                "reason": "goto_failed",
+                "html": "",
+                "body_excerpt": "",
+            },
+        }
+
+    await human_pause(1.4, 2.5)
     await accept_cookies(page)
-    await asyncio.sleep(0.4)
+    await human_pause(0.6, 1.2)
+    await human_mouse(page)
+    await human_scroll(page)
+    await human_pause(0.8, 1.3)
 
     diag = await collect_page_diagnostics(page)
-    reason = body_looks_empty_or_blocked(diag["body_text"])
+    reason = detect_challenge(diag)
 
-    entries = await extract_entries_via_dom(page)
+    if reason == "cloudflare_challenge":
+        append_log(
+            job,
+            f"    challenge detecte | title='{diag.get('title','')[:60]}' "
+            f"| final='{diag.get('url','')[:120]}'"
+        )
+        diag, reason = await wait_out_challenge(page, job, commune_nom, rubrique)
+
+    entries = []
+    if reason not in ("cloudflare_challenge", "captcha"):
+        entries = await extract_entries_via_dom(page)
 
     for e in entries:
         e["commune_scraped"] = commune_nom
@@ -496,12 +613,12 @@ async def scrape_single_url(page, url, commune_nom, rubrique, job):
         "entries": entries,
         "diag": {
             "url": url,
-            "title": diag["title"],
-            "final_url": diag["url"],
-            "pros_links": diag["pros_links"],
+            "title": diag.get("title", ""),
+            "final_url": diag.get("url", ""),
+            "pros_links": diag.get("pros_links", 0),
             "reason": reason or "",
-            "body_excerpt": diag["body_text"][:1200],
-            "html": diag["html"],
+            "body_excerpt": diag.get("body_text", "")[:1200],
+            "html": diag.get("html", ""),
         },
     }
 
@@ -511,11 +628,18 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pag
         extra_http_headers=HEADERS,
         viewport={"width": 1366, "height": 900},
         locale="fr-FR",
+        timezone_id=DEFAULT_TIMEZONE,
+        geolocation={"latitude": DEFAULT_LAT, "longitude": DEFAULT_LNG},
+        permissions=["geolocation"],
+        color_scheme="light",
+        ignore_https_errors=True,
     )
+    await ctx.add_init_script(STEALTH_JS)
+
     page = await ctx.new_page()
 
     await page.route(
-        "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
+        "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot,mp4,webm}",
         lambda r: r.abort()
     )
 
@@ -545,26 +669,27 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pag
                 "entries": len(entries),
             })
 
+            append_log(
+                job,
+                f"    {rubrique} p{page_num} | title='{page_diag.get('title','')[:60]}' | "
+                f"pros_links={page_diag.get('pros_links', 0)} | extracted={len(entries)} "
+                f"| reason={page_diag.get('reason', '') or 'none'}"
+            )
+
             if entries:
                 page_entries = entries
                 break
 
-            if page_diag.get("reason") == "blocked":
+            if page_diag.get("reason") in ("cloudflare_challenge", "captcha"):
                 html = page_diag.get("html", "")
                 if html:
-                    path = save_debug_text(job, "blocked", commune_nom, rubrique, html)
+                    path = save_debug_text(job, "challenge", commune_nom, rubrique, html)
                     if path:
-                        append_log(job, f"    DEBUG HTML bloque sauvegarde: {path}")
+                        append_log(job, f"    DEBUG HTML challenge sauvegarde: {path}")
                 break
 
         if not page_diag:
             break
-
-        append_log(
-            job,
-            f"    {rubrique} p{page_num} | title='{page_diag.get('title','')[:60]}' | "
-            f"pros_links={page_diag.get('pros_links', 0)} | extracted={len(page_entries)}"
-        )
 
         if not page_entries:
             if page_num == 1:
@@ -739,13 +864,13 @@ def run_scrape(job_id, communes, dpt, no_geocode):
             max_pages = 2
             rubriques_limit = 2
             delay_page = 0.5
-            delay_rub = 0.5
+            delay_rub = 0.6
             append_log(job, "Mode FAST active")
         else:
-            max_pages = 5
+            max_pages = 4
             rubriques_limit = None
-            delay_page = 1.2
-            delay_rub = 1.2
+            delay_page = 1.0
+            delay_rub = 1.0
 
         all_results = []
         global_seen = set()
@@ -755,11 +880,18 @@ def run_scrape(job_id, communes, dpt, no_geocode):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
+                    channel="chromium",
                     args=[
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-blink-features=AutomationControlled",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--disable-background-networking",
+                        "--disable-background-timer-throttling",
+                        "--disable-renderer-backgrounding",
+                        "--disable-ipc-flooding-protection",
+                        "--window-size=1366,900",
                     ],
                 )
 
@@ -884,7 +1016,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"ok": True, "server": "ELM Scraper API v3.2-diagnostics"})
+    return jsonify({"ok": True, "server": "ELM Scraper API v3.3-render-stealth"})
 
 
 @app.route("/scrape", methods=["POST", "OPTIONS"])
