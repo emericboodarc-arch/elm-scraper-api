@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ELM Scraper API — Deploiement Render.com
-Version job-based + mode FAST pour le dev
+Version job-based + diagnostics renforces + extraction PJ plus robuste
 """
 
 import asyncio
@@ -44,6 +44,9 @@ HEADERS = {
 DELAY_COMMUNE = 2.5
 JOB_RETENTION_SECONDS = 7 * 24 * 3600  # 7 jours
 
+DEBUG_DUMP_DIR = os.environ.get("ELM_DEBUG_DUMP_DIR", "/tmp/elm_debug")
+MAX_DEBUG_HTML_PER_JOB = 12
+
 
 # =============================================================================
 # JOB STATE
@@ -62,6 +65,7 @@ class JobState:
     commune: str = ""
     step: str = "idle"
     params: dict = field(default_factory=dict)
+    debug_files: list = field(default_factory=list)
 
 
 JOBS = {}
@@ -131,40 +135,43 @@ def require_api_key():
 
 # =============================================================================
 # CATEGORIES
+# Notes:
+# - on met d'abord des slugs PJ observes actuellement
+# - on garde quelques variantes/fallbacks ensuite
 # =============================================================================
 
 CATEGORIES = {
     "Personnes dependantes": [
         "service-a-la-personne",
-        "services-a-la-personne",
         "aide-a-domicile",
-        "accompagnement-personnes-agees",
-        "aide-aux-personnes-agees",
+        "services-a-domicile-pour-personnes-agees-personnes-dependantes",
+        "services-aux-particuliers",
         "maintien-a-domicile",
-        "soins-a-domicile",
         "assistance-administrative-a-domicile",
     ],
     "Menage Repassage": [
-        "menage-repassage-a-domicile",
-        "menage-repassage",
+        "aide-menagere-a-domicile",
+        "menage-a-domicile",
+        "service-a-la-personne",
+        "services-aux-particuliers",
         "femme-de-menage",
         "nettoyage-domicile",
     ],
     "Garde enfants": [
         "garde-d-enfants",
-        "assistante-maternelle",
         "baby-sitting",
         "creche",
         "micro-creche",
         "halte-garderie",
+        "assistante-maternelle",
     ],
     "Jardinage Bricolage": [
+        "petits-travaux-de-bricolage",
         "jardinage",
-        "jardinage-entretien-exterieur",
         "entretien-espaces-verts",
         "paysagistes",
-        "petits-travaux-bricolage",
         "bricolage-jardinage-petits-travaux",
+        "services-aux-particuliers",
     ],
 }
 
@@ -180,29 +187,78 @@ CAT_LABELS = {
 # HELPERS
 # =============================================================================
 
-def normalize_slug(text):
-    t = {
-        "\xe9": "e", "\xe8": "e", "\xea": "e", "\xeb": "e",
-        "\xe0": "a", "\xe2": "a", "\xe4": "a",
-        "\xf4": "o", "\xf6": "o", "\xee": "i", "\xef": "i",
-        "\xfb": "u", "\xf9": "u", "\xfc": "u",
-        "\xe7": "c", "\u0153": "oe", "\xe6": "ae",
-        " ": "-", "'": "-", "\u2019": "-", "/": "-",
+def normalize_slug(text: str) -> str:
+    s = (text or "").strip().lower()
+
+    repl = {
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "à": "a", "â": "a", "ä": "a",
+        "ô": "o", "ö": "o",
+        "î": "i", "ï": "i",
+        "ù": "u", "û": "u", "ü": "u",
+        "ç": "c", "œ": "oe", "æ": "ae",
+        "’": "-", "'": "-", "/": "-", " ": "-",
     }
-    s = text.lower()
-    for src, dst in t.items():
+    for src, dst in repl.items():
         s = s.replace(src, dst)
+
     s = re.sub(r"[^a-z0-9\-]", "", s)
-    return re.sub(r"-+", "-", s).strip("-")
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s
+
+
+def normalize_commune_label(text: str) -> str:
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    return s
 
 
 def pj_slug(commune, dpt):
     return f"{normalize_slug(commune)}-{dpt}"
 
 
-def build_url(slug, rubrique, page=1):
+def build_annuaire_url(slug, rubrique, page=1):
     base = f"https://www.pagesjaunes.fr/annuaire/{slug}/{rubrique}"
     return base if page == 1 else f"{base}?page={page}"
+
+
+def build_recherche_url(slug, rubrique, page=1):
+    base = f"https://www.pagesjaunes.fr/recherche/{slug}/{rubrique}"
+    return base if page == 1 else f"{base}?page={page}"
+
+
+def dedupe_key(nom, adresse, telephone):
+    n = normalize_slug(nom or "")
+    a = normalize_slug(adresse or "")
+    t = re.sub(r"\D", "", telephone or "")
+    return f"{n}|{a}|{t}"
+
+
+def safe_filename(s: str) -> str:
+    s = normalize_slug(s or "")
+    return s[:120] if s else "debug"
+
+
+def ensure_debug_dir():
+    os.makedirs(DEBUG_DUMP_DIR, exist_ok=True)
+    return DEBUG_DUMP_DIR
+
+
+def save_debug_text(job: JobState, kind: str, commune: str, rubrique: str, content: str) -> str:
+    ensure_debug_dir()
+
+    if len(job.debug_files) >= MAX_DEBUG_HTML_PER_JOB:
+        return ""
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{safe_filename(job.job_id)}__{safe_filename(commune)}__{safe_filename(rubrique)}__{kind}__{ts}.html"
+    path = os.path.join(DEBUG_DUMP_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content or "")
+
+    with JOBS_LOCK:
+        job.debug_files.append(path)
+
+    return path
 
 
 # =============================================================================
@@ -210,7 +266,14 @@ def build_url(slug, rubrique, page=1):
 # =============================================================================
 
 async def accept_cookies(page):
-    for sel in ["#onetrust-accept-btn-handler", "button#acceptAll", "button[id*='accept']"]:
+    for sel in [
+        "#onetrust-accept-btn-handler",
+        "button#acceptAll",
+        "button[id*='accept']",
+        "button[aria-label*='accepter']",
+        "button:has-text('Tout accepter')",
+        "button:has-text('Accepter')",
+    ]:
         try:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
@@ -221,119 +284,232 @@ async def accept_cookies(page):
             pass
 
 
-async def detect_selectors(page):
+async def collect_page_diagnostics(page):
+    title = ""
+    url = ""
+    body_text = ""
+    html = ""
+
+    try:
+        title = await page.title()
+    except Exception:
+        pass
+
+    try:
+        url = page.url
+    except Exception:
+        pass
+
+    try:
+        body_text = await page.inner_text("body")
+    except Exception:
+        pass
+
     try:
         html = await page.content()
     except Exception:
-        return {
-            "card": "article",
-            "nom": ["h2 a", "h3 a", "a[href*='/pros/']"],
-            "adresse": ["address"],
-            "ville": [],
-            "telephone": [],
-            "url_fiche": ["a[href*='/pros/']"],
-        }
+        pass
 
-    card_sel = "article"
-    for hint in ["bi-pro", "listing-result", "result-item", "search-result"]:
-        matches = re.findall(r'class="([^"]*' + hint + r'[^"]*)"', html)
-        if matches:
-            parts = [c for m in matches for c in m.split() if hint in c.lower()]
-            if parts:
-                card_sel = f"[class*='{Counter(parts).most_common(1)[0][0]}']"
-                break
+    pros_links = len(re.findall(r'/pros/\d+', html or ""))
 
     return {
-        "card": card_sel,
-        "nom": ["[class*='denomination']", "[class*='Denomination']", "h2 a", "h3 a", "a[href*='/pros/']"],
-        "adresse": ["[class*='address']", "[class*='adresse']", "[itemprop='streetAddress']", "address"],
-        "ville": ["[itemprop='addressLocality']", "[class*='city']", "[class*='locality']"],
-        "telephone": ["[class*='phone']", "[class*='tel']", "a[href^='tel:']"],
-        "url_fiche": ["a[href*='/pros/']", "h2 a", "h3 a"],
+        "title": title,
+        "url": url,
+        "body_text": body_text[:8000] if body_text else "",
+        "pros_links": pros_links,
+        "html": html,
     }
 
 
-async def get_text(el, sels):
-    for s in sels:
-        try:
-            child = await el.query_selector(s)
-            if child:
-                t = (await child.inner_text()).strip()
-                if t:
-                    return t
-        except Exception:
-            pass
-    return ""
+async def extract_entries_via_dom(page):
+    """
+    Extraction robuste:
+    - on part des liens /pros/
+    - on remonte vers un conteneur raisonnable
+    - on extrait nom / adresse / telephone via JS
+    """
+    js = r"""
+    () => {
+      const anchors = Array.from(document.querySelectorAll('a[href*="/pros/"]'));
+      const out = [];
+      const seen = new Set();
 
+      function clean(s) {
+        return (s || '').replace(/\s+/g, ' ').trim();
+      }
 
-async def get_attr(el, sels, attr="href"):
-    for s in sels:
-        try:
-            child = await el.query_selector(s)
-            if child:
-                v = await child.get_attribute(attr)
-                if v:
-                    return v
-        except Exception:
-            pass
-    return ""
+      function nearestCard(el) {
+        let cur = el;
+        for (let i = 0; i < 6 && cur; i++, cur = cur.parentElement) {
+          if (!cur) break;
+          const tag = (cur.tagName || '').toLowerCase();
+          const txt = clean(cur.innerText || '');
+          if (txt.length > 30 && txt.length < 2500 && ['article','li','section','div'].includes(tag)) {
+            return cur;
+          }
+        }
+        return el.parentElement || el;
+      }
 
+      function findPhone(text) {
+        const m = text.match(/(?:\+33|0)[1-9](?:[\s\.\-]?\d{2}){4}/);
+        return m ? clean(m[0]) : '';
+      }
 
-async def extract_cards(page, sels):
-    results = []
+      function findAddress(cardText) {
+        const lines = cardText.split('\n').map(clean).filter(Boolean);
+        for (const line of lines) {
+          if (/\b\d{5}\b/.test(line)) {
+            return line;
+          }
+        }
+        for (const line of lines) {
+          if (/\b(rue|avenue|av\.?|boulevard|bd\.?|place|pl\.?|chemin|route|impasse|all[ée]e|lieu-dit|za|zi)\b/i.test(line)) {
+            return line;
+          }
+        }
+        return '';
+      }
 
+      function findVille(addressLine, cardText) {
+        if (addressLine) {
+          const m = addressLine.match(/\b\d{5}\s+(.+)$/);
+          if (m) return clean(m[1]);
+        }
+        const lines = cardText.split('\n').map(clean).filter(Boolean);
+        for (const line of lines) {
+          const m = line.match(/\b\d{5}\s+(.+)$/);
+          if (m) return clean(m[1]);
+        }
+        return '';
+      }
+
+      for (const a of anchors) {
+        const href = a.getAttribute('href') || '';
+        const pros = href.match(/\/pros\/(\d+)/);
+        if (!pros) continue;
+
+        const card = nearestCard(a);
+        const cardText = clean(card.innerText || '');
+        if (!cardText) continue;
+
+        let nom = clean(a.innerText || '');
+        if (!nom || nom.length < 2) {
+          const h = card.querySelector('h1,h2,h3,h4,[class*="denomination"],[class*="title"]');
+          nom = clean(h ? h.innerText : '');
+        }
+        if (!nom || nom.length < 2) continue;
+
+        const adresse = findAddress(cardText);
+        const ville = findVille(adresse, cardText);
+        const telLink = card.querySelector('a[href^="tel:"]');
+        const telHref = telLink ? (telLink.getAttribute('href') || '') : '';
+        const telephone = telHref ? clean(telHref.replace(/^tel:/, '')) : findPhone(cardText);
+
+        const url_fiche = href.startsWith('http') ? href : ('https://www.pagesjaunes.fr' + href);
+        const key = pros[1] + '|' + nom.toLowerCase();
+
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        out.push({
+          nom,
+          adresse,
+          ville,
+          telephone,
+          url_fiche,
+          raw_excerpt: cardText.slice(0, 900),
+        });
+      }
+
+      return out;
+    }
+    """
     try:
-        cards = await page.query_selector_all(sels["card"])
+        return await page.evaluate(js)
     except Exception:
-        return results
+        return []
 
-    if not cards:
-        for fb in ["article", "[class*='result']", "[class*='listing']"]:
-            try:
-                cards = await page.query_selector_all(fb)
-                if cards:
-                    break
-            except Exception:
-                continue
 
-    if not cards:
-        return results
+def body_looks_empty_or_blocked(body: str) -> str:
+    txt = (body or "").lower()
 
-    for card in cards:
+    block_patterns = [
+        "captcha",
+        "vérifiez que vous êtes humain",
+        "verifiez que vous etes humain",
+        "accès refusé",
+        "access denied",
+        "forbidden",
+        "temporarily unavailable",
+    ]
+    for p in block_patterns:
+        if p in txt:
+            return "blocked"
+
+    empty_patterns = [
+        "aucun résultat",
+        "aucun resultat",
+        "0 résultat",
+        "0 resultat",
+        "aucun professionnel",
+    ]
+    for p in empty_patterns:
+        if p in txt:
+            return "empty"
+
+    return ""
+
+
+async def scrape_single_url(page, url, commune_nom, rubrique, job):
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except Exception:
         try:
-            nom = await get_text(card, sels["nom"])
-            if not nom:
-                continue
-
-            adresse = await get_text(card, sels["adresse"])
-            ville = await get_text(card, sels["ville"])
-            tel = await get_text(card, sels["telephone"])
-
-            if not tel:
-                h = await get_attr(card, ["a[href^='tel:']"], "href")
-                if h:
-                    tel = h.replace("tel:", "")
-
-            href = await get_attr(card, sels["url_fiche"], "href")
-            url_fiche = (href if href.startswith("http") else f"https://www.pagesjaunes.fr{href}") if href else ""
-
-            results.append({
-                "nom": nom,
-                "adresse": adresse.strip(),
-                "ville": re.sub(r"\s+", " ", ville).strip(),
-                "telephone": tel.strip(),
-                "url_fiche": url_fiche,
-            })
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:
-            continue
+            return {
+                "entries": [],
+                "diag": {
+                    "url": url,
+                    "title": "",
+                    "final_url": getattr(page, "url", url),
+                    "pros_links": 0,
+                    "reason": "goto_failed",
+                },
+            }
 
-    return results
+    await asyncio.sleep(1.0)
+    await accept_cookies(page)
+    await asyncio.sleep(0.4)
+
+    diag = await collect_page_diagnostics(page)
+    reason = body_looks_empty_or_blocked(diag["body_text"])
+
+    entries = await extract_entries_via_dom(page)
+
+    for e in entries:
+        e["commune_scraped"] = commune_nom
+        e["rubrique_pj"] = rubrique
+
+    return {
+        "entries": entries,
+        "diag": {
+            "url": url,
+            "title": diag["title"],
+            "final_url": diag["url"],
+            "pros_links": diag["pros_links"],
+            "reason": reason or "",
+            "body_excerpt": diag["body_text"][:1200],
+            "html": diag["html"],
+        },
+    }
 
 
-async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pages, delay_page):
+async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pages, delay_page, job):
     ctx = await browser.new_context(
         extra_http_headers=HEADERS,
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": 1366, "height": 900},
         locale="fr-FR",
     )
     page = await ctx.new_page()
@@ -343,66 +519,80 @@ async def scrape_rubrique(browser, slug, commune_nom, cat_key, rubrique, max_pag
         lambda r: r.abort()
     )
 
-    results, seen = [], set()
+    results = []
+    seen = set()
+    diag_rows = []
 
-    sels = {
-        "card": "article",
-        "nom": ["h2 a"],
-        "adresse": ["address"],
-        "ville": [],
-        "telephone": [],
-        "url_fiche": ["a[href*='/pros/']"],
-    }
+    url_builders = [build_annuaire_url, build_recherche_url]
 
     for page_num in range(1, max_pages + 1):
-        url = build_url(slug, rubrique, page_num)
+        page_entries = []
+        page_diag = None
 
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=25000)
-        except Exception:
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=5000)
-            except Exception:
+        for builder in url_builders:
+            url = builder(slug, rubrique, page_num)
+            payload = await scrape_single_url(page, url, commune_nom, rubrique, job)
+            entries = payload["entries"]
+            page_diag = payload["diag"]
+
+            diag_rows.append({
+                "page": page_num,
+                "url": page_diag.get("url", ""),
+                "final_url": page_diag.get("final_url", ""),
+                "title": page_diag.get("title", ""),
+                "pros_links": page_diag.get("pros_links", 0),
+                "reason": page_diag.get("reason", ""),
+                "entries": len(entries),
+            })
+
+            if entries:
+                page_entries = entries
                 break
 
-        await asyncio.sleep(1.0 if delay_page >= 1 else 0.5)
+            if page_diag.get("reason") == "blocked":
+                html = page_diag.get("html", "")
+                if html:
+                    path = save_debug_text(job, "blocked", commune_nom, rubrique, html)
+                    if path:
+                        append_log(job, f"    DEBUG HTML bloque sauvegarde: {path}")
+                break
 
-        if page_num == 1:
-            await accept_cookies(page)
-            await asyncio.sleep(0.3)
-            sels = await detect_selectors(page)
-
-        try:
-            body = await page.inner_text("body")
-        except Exception:
+        if not page_diag:
             break
 
-        if any(p in body.lower() for p in ["aucun r\xe9sultat", "aucun resultat", "0 r\xe9sultat", "aucun professionnel"]):
+        append_log(
+            job,
+            f"    {rubrique} p{page_num} | title='{page_diag.get('title','')[:60]}' | "
+            f"pros_links={page_diag.get('pros_links', 0)} | extracted={len(page_entries)}"
+        )
+
+        if not page_entries:
+            if page_num == 1:
+                html = page_diag.get("html", "")
+                if html:
+                    path = save_debug_text(job, "empty", commune_nom, rubrique, html)
+                    if path:
+                        append_log(job, f"    DEBUG HTML vide sauvegarde: {path}")
             break
 
-        cards = await extract_cards(page, sels)
-
-        if not cards and page.url != url:
-            sels = await detect_selectors(page)
-            cards = await extract_cards(page, sels)
-
-        if not cards:
-            break
-
-        for r in cards:
-            key = (r["nom"] + r["adresse"]).lower().strip()
+        added = 0
+        for r in page_entries:
+            key = dedupe_key(r.get("nom"), r.get("adresse"), r.get("telephone"))
             if key and key not in seen:
-                r["commune_scraped"] = commune_nom
                 results.append(r)
                 seen.add(key)
+                added += 1
 
-        if len(cards) < 10:
+        if added == 0:
+            break
+
+        if len(page_entries) < 5:
             break
 
         await asyncio.sleep(delay_page)
 
     await ctx.close()
-    return results
+    return results, diag_rows
 
 
 # =============================================================================
@@ -439,14 +629,14 @@ ABBREV = {
 
 
 def expand(addr):
-    s = addr.lower()
+    s = (addr or "").lower()
     for pat, rep in ABBREV.items():
         s = re.sub(pat, rep, s)
     return s
 
 
 def clean_ville(raw, fallback):
-    v = re.sub(r'\b\d{5}\b', '', raw)
+    v = re.sub(r'\b\d{5}\b', '', raw or "")
     v = re.sub(r'\b\d{2}\b', '', v)
     v = re.sub(r'\s+', ' ', v).strip().strip('-')
     return v if v else fallback
@@ -539,25 +729,27 @@ def run_scrape(job_id, communes, dpt, no_geocode):
             job.done = 0
             job.total = len(communes)
             job.step = "starting"
+            job.debug_files = []
 
         append_log(job, f"Demarrage — {len(communes)} communes, dpt {dpt}")
 
         fast = bool(job.params.get("fast", False))
 
         if fast:
-            max_pages = 3
+            max_pages = 2
             rubriques_limit = 2
             delay_page = 0.5
             delay_rub = 0.5
             append_log(job, "Mode FAST active")
         else:
-            max_pages = 20
+            max_pages = 5
             rubriques_limit = None
-            delay_page = 1.5
-            delay_rub = 2.0
+            delay_page = 1.2
+            delay_rub = 1.2
 
         all_results = []
         global_seen = set()
+        diagnostics = []
 
         async def scrape():
             async with async_playwright() as p:
@@ -577,44 +769,55 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                         job.commune = commune
                         job.done = i_c
 
+                    commune = normalize_commune_label(commune)
                     append_log(job, f"[{i_c+1}/{len(communes)}] {commune}")
+
                     slug = pj_slug(commune, dpt)
+                    append_log(job, f"  slug={slug}")
 
                     for cat_key, rubriques in CATEGORIES.items():
-                        if rubriques_limit:
-                            rubriques = rubriques[:rubriques_limit]
-
+                        current_rubriques = rubriques[:rubriques_limit] if rubriques_limit else list(rubriques)
                         cat_label = CAT_LABELS[cat_key]
                         cat_new = 0
 
-                        for rubrique in rubriques:
-                            res = await scrape_rubrique(
+                        for rubrique in current_rubriques:
+                            res, diag_rows = await scrape_rubrique(
                                 browser=browser,
                                 slug=slug,
                                 commune_nom=commune,
                                 cat_key=cat_key,
                                 rubrique=rubrique,
                                 max_pages=max_pages,
-                                delay_page=delay_page
+                                delay_page=delay_page,
+                                job=job,
                             )
 
-                            for r in res:
-                                kl = (r["nom"] + r["adresse"]).lower().strip()
-                                kg = normalize_slug(r["nom"]) + r.get("telephone", "")
+                            diagnostics.extend([
+                                {
+                                    "commune": commune,
+                                    "categorie": cat_label,
+                                    "rubrique": rubrique,
+                                    **d,
+                                }
+                                for d in diag_rows
+                            ])
 
-                                if kl and kl not in global_seen and kg not in global_seen:
+                            brut = len(res)
+                            append_log(job, f"    {rubrique}: brut={brut}")
+
+                            for r in res:
+                                kl = dedupe_key(r.get("nom"), r.get("adresse"), r.get("telephone"))
+                                if kl and kl not in global_seen:
                                     r["categorie"] = cat_label
                                     r["rubrique_pj"] = rubrique
                                     all_results.append(r)
                                     global_seen.add(kl)
-                                    global_seen.add(kg)
                                     cat_new += 1
 
                             if res:
                                 await asyncio.sleep(delay_rub)
 
-                        if cat_new:
-                            append_log(job, f"  {cat_label}: +{cat_new}")
+                        append_log(job, f"  {cat_label}: +{cat_new}")
 
                     append_log(job, f"  Partiel: {len(all_results)} concurrents")
 
@@ -650,8 +853,10 @@ def run_scrape(job_id, communes, dpt, no_geocode):
                 "total_geocodes": total_geo,
                 "stats_par_categorie": stats,
                 "fast": fast,
+                "debug_files": list(job.debug_files),
             },
             "concurrents": all_results,
+            "diagnostics": diagnostics[-500:],
         }
 
         with JOBS_LOCK:
@@ -679,7 +884,7 @@ def run_scrape(job_id, communes, dpt, no_geocode):
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"ok": True, "server": "ELM Scraper API v3.1-fast"})
+    return jsonify({"ok": True, "server": "ELM Scraper API v3.2-diagnostics"})
 
 
 @app.route("/scrape", methods=["POST", "OPTIONS"])
@@ -759,6 +964,7 @@ def status():
         "log": job.log[-50:],
         "created_at": job.created_at,
         "params": job.params,
+        "debug_files": job.debug_files[-20:],
     })
 
 
@@ -807,6 +1013,7 @@ def result_summary():
         "date_extraction": meta.get("date_extraction", ""),
         "stats_par_categorie": meta.get("stats_par_categorie", {}),
         "fast": meta.get("fast", False),
+        "debug_files": meta.get("debug_files", []),
     })
 
 
@@ -832,6 +1039,7 @@ def jobs():
                 "error": job.error,
                 "has_result": job.result is not None,
                 "params": job.params,
+                "debug_files": job.debug_files[-10:],
             })
 
     out.sort(key=lambda x: x["created_at"], reverse=True)
